@@ -1,5 +1,5 @@
 """
-Handlekurv Optimizer – alt i én fil
+Handlekurv Optimizer
 Kjør med: streamlit run app.py
 """
 
@@ -7,7 +7,6 @@ import time
 import json
 import uuid
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 import requests
@@ -15,7 +14,15 @@ import pandas as pd
 import streamlit as st
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KASSALAPP API-KLIENT
+# KONFIGURASJON – hardkodet
+# ══════════════════════════════════════════════════════════════════════════════
+
+KASSALAPP_API_KEY = "XtpH4ZI1stdvqogYHzz5iyFoRKW89zGsTvMdtvvX"
+SUPABASE_URL      = "https://liptedpuxhifwqkiglpn.supabase.co"
+SUPABASE_KEY      = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxpcHRlZHB1eGhpZndxa2lnbHBuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgxNjUxNzMsImV4cCI6MjA5Mzc0MTE3M30.tRQgdqF0DAJRcrcNifRGgMo4gRwmVNdIiUdvBYETDgg"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KASSALAPP API
 # ══════════════════════════════════════════════════════════════════════════════
 
 BASE_URL = "https://kassal.app/api/v1"
@@ -34,9 +41,24 @@ STORE_NAMES = {
     "ODA_NO":     "Oda",
 }
 
+STORE_EMOJI = {
+    "REMA_1000":  "🔴",
+    "KIWI":       "🟡",
+    "SPAR_NO":    "🟢",
+    "MENY_NO":    "🔵",
+    "BUNNPRIS":   "🟠",
+    "COOP_EXTRA": "🟣",
+    "COOP_OBS":   "⚫",
+    "COOP_MEGA":  "🟤",
+    "COOP_PRIX":  "🔴",
+    "JOKER_NO":   "🃏",
+    "ODA_NO":     "📦",
+}
+
 
 class KassalappClient:
     def __init__(self, api_key: str):
+        self.api_key = api_key
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {api_key}",
@@ -47,149 +69,170 @@ class KassalappClient:
 
     def _throttle(self):
         elapsed = time.time() - self._last_call
-        if elapsed < 0.05:
-            time.sleep(0.05 - elapsed)
+        if elapsed < 0.1:
+            time.sleep(0.1 - elapsed)
         self._last_call = time.time()
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
         self._throttle()
-        resp = self.session.get(f"{BASE_URL}/{endpoint.lstrip('/')}", params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = self.session.get(
+                f"{BASE_URL}/{endpoint.lstrip('/')}",
+                params=params,
+                timeout=15,
+            )
+            if resp.status_code == 401:
+                st.error("API-nøkkel ugyldig (401). Kontakt admin.")
+                return {}
+            if resp.status_code == 429:
+                st.warning("For mange forespørsler – vent litt og prøv igjen.")
+                return {}
+            if resp.status_code == 422:
+                st.warning("Ugyldig søk. Prøv et annet søkeord.")
+                return {}
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.Timeout:
+            st.error("Tidsavbrudd – Kassalapp svarte ikke. Prøv igjen.")
+            return {}
+        except requests.exceptions.ConnectionError:
+            st.error("Nettverksfeil – sjekk internettforbindelsen.")
+            return {}
+        except Exception as e:
+            st.error(f"Uventet feil: {type(e).__name__}")
+            return {}
 
     def _post(self, endpoint: str, payload: dict) -> dict:
         self._throttle()
-        resp = self.session.post(f"{BASE_URL}/{endpoint.lstrip('/')}", json=payload, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = self.session.post(
+                f"{BASE_URL}/{endpoint.lstrip('/')}",
+                json=payload,
+                timeout=20,
+            )
+            if resp.status_code == 401:
+                st.error("API-nøkkel ugyldig (401). Kontakt admin.")
+                return {}
+            if resp.status_code == 429:
+                st.warning("For mange forespørsler – vent litt og prøv igjen.")
+                return {}
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.Timeout:
+            st.error("Tidsavbrudd ved henting av priser.")
+            return {}
+        except Exception as e:
+            st.error(f"Uventet feil: {type(e).__name__}")
+            return {}
 
-    def search_products(self, query: str, size: int = 20, unique: bool = True) -> list[dict]:
-        data = self._get("/products", {"search": query, "size": size, "unique": str(unique).lower()})
-        return data.get("data", [])
+    def search_products(self, query: str, size: int = 20) -> list[dict]:
+        if not query or not query.strip():
+            return []
+        data = self._get("/products", {
+            "search": query.strip(),
+            "size": size,
+            "unique": "true",
+            "sort": "name_asc",
+        })
+        return data.get("data", []) if data else []
 
-    def get_bulk_prices(self, eans: list[str], days: int = 30) -> list[dict]:
+    def get_bulk_prices(self, eans: list[str]) -> list[dict]:
         results = []
         for i in range(0, len(eans), 100):
             batch = eans[i:i+100]
-            try:
-                data = self._post("/products/prices-bulk", {"eans": batch, "days": days, "aggregation": "min"})
+            data = self._post("/products/prices-bulk", {
+                "eans": batch,
+                "days": 7,
+                "aggregation": "min",
+            })
+            if data:
                 results.extend(data.get("data", []))
-            except Exception as e:
-                st.warning(f"Feil ved henting av priser: {e}")
         return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE (Supabase eller lokal JSON-fil)
+# SUPABASE DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
-LOCAL_FILE = Path("handlekurver_local.json")
-
-
 class Database:
-    def __init__(self, supabase_url: Optional[str] = None, supabase_key: Optional[str] = None):
-        self.use_supabase = bool(supabase_url and supabase_key)
+    def __init__(self):
         self._sb = None
+        try:
+            from supabase import create_client
+            self._sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            st.warning(f"Database ikke tilgjengelig: {e}")
 
-        if self.use_supabase:
-            try:
-                from supabase import create_client
-                self._sb = create_client(supabase_url, supabase_key)
-            except Exception as e:
-                st.warning(f"Supabase feilet ({e}), bruker lokal lagring.")
-                self.use_supabase = False
+    def _ok(self) -> bool:
+        return self._sb is not None
 
-        self._data = self._load_local()
-
-    def _load_local(self) -> dict:
-        if LOCAL_FILE.exists():
-            try:
-                return json.loads(LOCAL_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {"handlekurver": []}
-
-    def _save_local(self):
-        LOCAL_FILE.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def create_handlekurv(self, name: str) -> dict:
-        kurv = {"id": str(uuid.uuid4()), "name": name, "created_at": datetime.utcnow().isoformat(), "items": []}
-        if self.use_supabase:
-            try:
-                self._sb.table("handlekurver").insert({"id": kurv["id"], "name": name, "created_at": kurv["created_at"]}).execute()
-                return kurv
-            except Exception as e:
-                st.warning(f"Supabase feil: {e}")
-        self._data["handlekurver"].append(kurv)
-        self._save_local()
-        return kurv
+    def create_handlekurv(self, name: str) -> Optional[dict]:
+        if not self._ok():
+            return None
+        try:
+            row = {"id": str(uuid.uuid4()), "name": name, "created_at": datetime.utcnow().isoformat()}
+            self._sb.table("handlekurver").insert(row).execute()
+            row["items"] = []
+            return row
+        except Exception as e:
+            st.error(f"Kunne ikke opprette handlekurv: {e}")
+            return None
 
     def get_handlekurver(self) -> list[dict]:
-        if self.use_supabase:
-            try:
-                kurver = self._sb.table("handlekurver").select("*").order("created_at", desc=True).execute().data or []
-                items_all = self._sb.table("handlekurv_items").select("*").execute().data or []
-                for k in kurver:
-                    k["items"] = [i for i in items_all if i["kurv_id"] == k["id"]]
-                return kurver
-            except Exception as e:
-                st.warning(f"Supabase feil: {e}")
-        return self._data.get("handlekurver", [])
+        if not self._ok():
+            return []
+        try:
+            kurver = self._sb.table("handlekurver").select("*").order("created_at", desc=False).execute().data or []
+            items  = self._sb.table("handlekurv_items").select("*").execute().data or []
+            for k in kurver:
+                k["items"] = sorted(
+                    [i for i in items if i["kurv_id"] == k["id"]],
+                    key=lambda x: x.get("added_at", ""),
+                )
+            return kurver
+        except Exception as e:
+            st.error(f"Kunne ikke hente handlekurver: {e}")
+            return []
 
     def delete_handlekurv(self, kurv_id: str):
-        if self.use_supabase:
-            try:
-                self._sb.table("handlekurv_items").delete().eq("kurv_id", kurv_id).execute()
-                self._sb.table("handlekurver").delete().eq("id", kurv_id).execute()
-                return
-            except Exception as e:
-                st.warning(f"Supabase feil: {e}")
-        self._data["handlekurver"] = [k for k in self._data["handlekurver"] if k["id"] != kurv_id]
-        self._save_local()
+        if not self._ok():
+            return
+        try:
+            self._sb.table("handlekurv_items").delete().eq("kurv_id", kurv_id).execute()
+            self._sb.table("handlekurver").delete().eq("id", kurv_id).execute()
+        except Exception as e:
+            st.error(f"Feil ved sletting: {e}")
 
-    def add_item(self, kurv_id: str, item: dict) -> dict:
-        obj = {
-            "id": str(uuid.uuid4()), "kurv_id": kurv_id,
-            "name": item.get("name", ""), "ean": item.get("ean"),
-            "brand": item.get("brand"), "image": item.get("image"),
-            "quantity": item.get("quantity", 1), "added_at": datetime.utcnow().isoformat(),
-        }
-        if self.use_supabase:
-            try:
-                self._sb.table("handlekurv_items").insert(obj).execute()
-                return obj
-            except Exception as e:
-                st.warning(f"Supabase feil: {e}")
-        for k in self._data["handlekurver"]:
-            if k["id"] == kurv_id:
-                k.setdefault("items", []).append(obj)
-                break
-        self._save_local()
-        return obj
+    def add_item(self, kurv_id: str, name: str, ean: Optional[str], brand: Optional[str]) -> Optional[dict]:
+        if not self._ok():
+            return None
+        try:
+            row = {
+                "id": str(uuid.uuid4()), "kurv_id": kurv_id,
+                "name": name, "ean": ean, "brand": brand,
+                "quantity": 1, "added_at": datetime.utcnow().isoformat(),
+            }
+            self._sb.table("handlekurv_items").insert(row).execute()
+            return row
+        except Exception as e:
+            st.error(f"Feil ved å legge til vare: {e}")
+            return None
 
     def update_quantity(self, item_id: str, quantity: int):
-        if self.use_supabase:
-            try:
-                self._sb.table("handlekurv_items").update({"quantity": quantity}).eq("id", item_id).execute()
-                return
-            except Exception as e:
-                st.warning(f"Supabase feil: {e}")
-        for k in self._data["handlekurver"]:
-            for i in k.get("items", []):
-                if i["id"] == item_id:
-                    i["quantity"] = quantity
-        self._save_local()
+        if not self._ok():
+            return
+        try:
+            self._sb.table("handlekurv_items").update({"quantity": quantity}).eq("id", item_id).execute()
+        except Exception:
+            pass
 
     def remove_item(self, item_id: str):
-        if self.use_supabase:
-            try:
-                self._sb.table("handlekurv_items").delete().eq("id", item_id).execute()
-                return
-            except Exception as e:
-                st.warning(f"Supabase feil: {e}")
-        for k in self._data["handlekurver"]:
-            k["items"] = [i for i in k.get("items", []) if i["id"] != item_id]
-        self._save_local()
+        if not self._ok():
+            return
+        try:
+            self._sb.table("handlekurv_items").delete().eq("id", item_id).execute()
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,29 +240,32 @@ class Database:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Optimizer:
-    def __init__(self, bulk_prices: list[dict], basket_items: list[dict], preferred_stores: list[str]):
+    def __init__(self, bulk_prices: list[dict], basket_items: list[dict], preferred: list[str]):
         self.basket_items = basket_items
-
         self._prices: dict[str, dict[str, float]] = {}
+
         for p in bulk_prices:
             ean = p.get("ean", "")
             self._prices[ean] = {
                 s["store"]: float(s["current_price"])
                 for s in p.get("stores", [])
-                if s.get("current_price") is not None
+                if s.get("current_price") is not None and s.get("store")
             }
 
         all_stores = {s for prices in self._prices.values() for s in prices}
-        preferred = set(preferred_stores) & all_stores
-        self.active_stores = preferred if preferred else all_stores
+        preferred_set = set(preferred) & all_stores
+        self.active_stores = preferred_set if preferred_set else all_stores
 
     def _name(self, code: str) -> str:
         return STORE_NAMES.get(code, code)
 
-    def rank_stores(self) -> list[tuple[str, dict]]:
+    def _emoji(self, code: str) -> str:
+        return STORE_EMOJI.get(code, "🏪")
+
+    def rank_stores(self) -> list[dict]:
         results = []
         for code in self.active_stores:
-            total, found = 0.0, 0
+            total, found, missing = 0.0, 0, []
             for item in self.basket_items:
                 ean, qty = item.get("ean"), item.get("quantity", 1)
                 if not ean:
@@ -228,12 +274,21 @@ class Optimizer:
                 if price is not None:
                     total += price * qty
                     found += 1
+                else:
+                    missing.append(item["name"])
             if found > 0:
-                results.append((code, {"store_name": self._name(code), "total": round(total, 2), "found_items": found}))
-        results.sort(key=lambda x: x[1]["total"])
+                results.append({
+                    "code": code,
+                    "name": self._name(code),
+                    "emoji": self._emoji(code),
+                    "total": round(total, 2),
+                    "found": found,
+                    "missing": missing,
+                })
+        results.sort(key=lambda x: x["total"])
         return results
 
-    def optimize_split(self, max_stores: int = 3) -> list[dict]:
+    def optimize_split(self, max_stores: int) -> list[dict]:
         assignments = []
         for item in self.basket_items:
             ean, qty = item.get("ean"), item.get("quantity", 1)
@@ -247,7 +302,9 @@ class Optimizer:
             assignments.append({
                 "ean": ean, "name": item["name"], "quantity": qty,
                 "store_code": best, "store_name": self._name(best),
-                "price": round(valid[best] * qty, 2), "all_prices": valid,
+                "store_emoji": self._emoji(best),
+                "price": round(valid[best] * qty, 2),
+                "_all": valid,
             })
 
         while len({a["store_code"] for a in assignments}) > max_stores:
@@ -257,252 +314,609 @@ class Optimizer:
             remaining = unique - {smallest}
             for a in assignments:
                 if a["store_code"] == smallest:
-                    candidates = {s: a["all_prices"].get(s) for s in remaining if a["all_prices"].get(s) is not None}
-                    if candidates:
-                        new = min(candidates, key=candidates.get)
-                        a.update({"store_code": new, "store_name": self._name(new), "price": round(candidates[new] * a["quantity"], 2)})
+                    cands = {s: a["_all"][s] for s in remaining if s in a["_all"]}
+                    if cands:
+                        new = min(cands, key=cands.get)
+                        a.update({"store_code": new, "store_name": self._name(new),
+                                  "store_emoji": self._emoji(new),
+                                  "price": round(cands[new] * a["quantity"], 2)})
+            if not remaining:
+                break
 
         for a in assignments:
-            a.pop("all_prices", None)
+            a.pop("_all", None)
         return assignments
 
     def price_matrix(self) -> Optional[pd.DataFrame]:
-        rows, index = [], []
+        rows, idx = [], []
         for item in self.basket_items:
             ean = item.get("ean")
             if not ean or not self._prices.get(ean):
                 continue
-            row = {self._name(c): self._prices[ean].get(c) for c in sorted(self.active_stores)}
+            row = {}
+            for code in sorted(self.active_stores):
+                p = self._prices[ean].get(code)
+                row[self._name(code)] = round(p, 2) if p else None
             rows.append(row)
-            index.append(item["name"][:40])
-        return pd.DataFrame(rows, index=index) if rows else None
+            idx.append(item["name"][:35])
+        return pd.DataFrame(rows, index=idx) if rows else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAMLIT UI
+# STREAMLIT APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Handlekurv Optimizer", page_icon="🛒", layout="wide")
+st.set_page_config(
+    page_title="Handlekurv Optimizer",
+    page_icon="🛒",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown("""
 <style>
-.savings { background:#28a745; color:white; padding:0.2rem 0.7rem; border-radius:20px; font-size:0.85rem; font-weight:600; }
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
+}
+
+/* Hide Streamlit chrome */
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding-top: 2rem; padding-bottom: 3rem; }
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: #0f0f13;
+    border-right: 1px solid #1e1e2e;
+}
+[data-testid="stSidebar"] * { color: #e0e0e0 !important; }
+[data-testid="stSidebar"] .stMarkdown h2 {
+    font-family: 'Syne', sans-serif;
+    font-size: 1rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #888 !important;
+    margin-bottom: 1rem;
+}
+
+/* App background */
+.stApp { background: #0a0a0f; }
+
+/* Main heading */
+.app-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 2.8rem;
+    font-weight: 800;
+    color: #ffffff;
+    letter-spacing: -0.02em;
+    line-height: 1;
+    margin-bottom: 0.2rem;
+}
+.app-sub {
+    font-size: 1rem;
+    color: #666;
+    margin-bottom: 2.5rem;
+    font-weight: 300;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+    background: transparent;
+    border-bottom: 1px solid #1e1e2e;
+    gap: 0;
+}
+.stTabs [data-baseweb="tab"] {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    color: #555 !important;
+    padding: 0.75rem 1.5rem;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+}
+.stTabs [aria-selected="true"] {
+    color: #fff !important;
+    border-bottom: 2px solid #7c5cfc;
+    background: transparent;
+}
+
+/* Input fields */
+.stTextInput input, .stNumberInput input {
+    background: #13131a !important;
+    border: 1px solid #2a2a3a !important;
+    border-radius: 10px !important;
+    color: #fff !important;
+    font-family: 'DM Sans', sans-serif !important;
+}
+.stTextInput input:focus, .stNumberInput input:focus {
+    border-color: #7c5cfc !important;
+    box-shadow: 0 0 0 2px rgba(124,92,252,0.2) !important;
+}
+
+/* Buttons */
+.stButton button {
+    background: #7c5cfc !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-family: 'Syne', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.85rem !important;
+    letter-spacing: 0.05em !important;
+    padding: 0.6rem 1.2rem !important;
+    transition: all 0.2s ease !important;
+}
+.stButton button:hover {
+    background: #6a4ae8 !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(124,92,252,0.4) !important;
+}
+.stButton button[kind="secondary"] {
+    background: #1e1e2e !important;
+    color: #888 !important;
+}
+.stButton button[kind="secondary"]:hover {
+    background: #2a2a3a !important;
+    color: #fff !important;
+}
+
+/* Cards */
+.card {
+    background: #13131a;
+    border: 1px solid #1e1e2e;
+    border-radius: 14px;
+    padding: 1.2rem 1.4rem;
+    margin-bottom: 0.8rem;
+    transition: border-color 0.2s;
+}
+.card:hover { border-color: #2a2a3a; }
+.card-best {
+    border-color: #7c5cfc;
+    background: linear-gradient(135deg, #13131a 0%, #1a1428 100%);
+}
+
+/* Badges */
+.badge-best {
+    background: #7c5cfc;
+    color: #fff;
+    padding: 0.2rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    font-family: 'Syne', sans-serif;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+.badge-saving {
+    background: #1a3a2a;
+    color: #4ade80;
+    border: 1px solid #4ade80;
+    padding: 0.2rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    font-family: 'Syne', sans-serif;
+}
+
+/* Product row */
+.product-row {
+    background: #13131a;
+    border: 1px solid #1e1e2e;
+    border-radius: 10px;
+    padding: 0.7rem 1rem;
+    margin-bottom: 0.5rem;
+}
+
+/* Store tag */
+.store-tag {
+    display: inline-block;
+    background: #1e1e2e;
+    border-radius: 6px;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.75rem;
+    color: #888;
+    font-family: 'Syne', sans-serif;
+}
+
+/* Savings box */
+.savings-box {
+    background: linear-gradient(135deg, #0d2818, #0a1f12);
+    border: 1px solid #2d6a4a;
+    border-radius: 14px;
+    padding: 1.2rem 1.6rem;
+    margin: 1rem 0;
+}
+.savings-amount {
+    font-family: 'Syne', sans-serif;
+    font-size: 2.2rem;
+    font-weight: 800;
+    color: #4ade80;
+}
+
+/* Multiselect */
+[data-baseweb="tag"] {
+    background: #7c5cfc !important;
+    border-radius: 6px !important;
+}
+
+/* Dataframe */
+[data-testid="stDataFrame"] {
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid #1e1e2e;
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+    background: #13131a !important;
+    border: 1px solid #1e1e2e !important;
+    border-radius: 10px !important;
+    color: #fff !important;
+    font-family: 'DM Sans', sans-serif !important;
+}
+
+/* Divider */
+hr { border-color: #1e1e2e !important; }
+
+/* Text colors */
+p, label, .stMarkdown { color: #c0c0c0; }
+h1, h2, h3 { color: #fff; font-family: 'Syne', sans-serif; }
+
+/* Success / info / warning */
+.stSuccess { background: #0d2818 !important; border-color: #4ade80 !important; }
+.stInfo    { background: #0d1a2e !important; border-color: #60a5fa !important; }
+
+/* Number input buttons */
+.stNumberInput button {
+    background: #1e1e2e !important;
+    padding: 0.2rem 0.4rem !important;
+    min-height: unset !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
-for k, v in {"client": None, "db": None, "search_results": [], "favoritter": ["REMA_1000", "KIWI", "SPAR_NO"]}.items():
+# ── Session state init ─────────────────────────────────────────────────────────
+@st.cache_resource
+def get_client():
+    return KassalappClient(KASSALAPP_API_KEY)
+
+@st.cache_resource
+def get_db():
+    return Database()
+
+client = get_client()
+db     = get_db()
+
+for k, v in {
+    "search_results": [],
+    "favoritter": ["REMA_1000", "KIWI", "SPAR_NO", "BUNNPRIS"],
+    "last_query": "",
+}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Sidepanel ─────────────────────────────────────────────────────────────────
+# ── Sidebar: kun butikkvalg ────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚙️ Innstillinger")
-    api_key      = st.text_input("Kassalapp API-nøkkel", type="password")
-    supabase_url = st.text_input("Supabase URL (valgfritt)", placeholder="https://xxx.supabase.co")
-    supabase_key = st.text_input("Supabase Anon Key (valgfritt)", type="password")
+    st.markdown("## 🏪 Mine butikker")
+    st.caption("Velg butikkene du har i nærheten")
 
-    if st.button("💾 Koble til", use_container_width=True):
-        if api_key:
-            st.session_state.client = KassalappClient(api_key)
-            st.session_state.db = Database(supabase_url or None, supabase_key or None)
-            st.success("✅ Koblet til!")
-        else:
-            st.error("Fyll inn API-nøkkel!")
-
-    st.divider()
-    st.markdown("### 🏪 Butikker i nærheten")
     st.session_state.favoritter = st.multiselect(
-        "Velg butikker du har tilgang til",
+        "Butikker",
         options=list(STORE_NAMES.keys()),
         default=st.session_state.favoritter,
-        format_func=lambda x: STORE_NAMES.get(x, x),
+        format_func=lambda x: f"{STORE_EMOJI.get(x, '')} {STORE_NAMES.get(x, x)}",
+        label_visibility="collapsed",
     )
 
-# ── Hovedinnhold ───────────────────────────────────────────────────────────────
-st.markdown("# 🛒 Handlekurv Optimizer")
-st.caption("Finn billigste butikk – eller kombiner flere for å spare mest mulig")
+    st.divider()
+    st.caption("Priser fra Kassalapp · Oppdateres daglig")
 
-tab1, tab2, tab3 = st.tabs(["🔍 Søk etter varer", "🧺 Mine handlekurver", "📊 Prisanalyse"])
+# ── Header ─────────────────────────────────────────────────────────────────────
+st.markdown('<p class="app-title">🛒 Handlekurv</p>', unsafe_allow_html=True)
+st.markdown('<p class="app-sub">Finn billigste butikk – eller kombiner flere og spar mer</p>', unsafe_allow_html=True)
 
-# ── TAB 1: Søk ────────────────────────────────────────────────────────────────
+# ── Tabs ───────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["SØK ETTER VARER", "MINE HANDLEKURVER", "PRISANALYSE"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 – SØK
+# ══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    c1, c2 = st.columns([4, 1])
+    st.markdown("### Søk etter varer")
+
+    c1, c2 = st.columns([5, 1])
     with c1:
-        query = st.text_input("Søk", placeholder="f.eks. melk, havregryn, Grandiosa...", label_visibility="collapsed")
+        query = st.text_input(
+            "søk",
+            placeholder="Skriv et produktnavn, f.eks. melk, havregryn, ost ...",
+            label_visibility="collapsed",
+            key="search_input",
+        )
     with c2:
-        do_search = st.button("🔍 Søk", use_container_width=True)
+        do_search = st.button("Søk →", use_container_width=True)
 
-    if do_search:
-        if not st.session_state.client:
-            st.error("Koble til API-nøkkel i sidepanelet først.")
-        elif not query:
-            st.warning("Skriv inn et søkeord.")
-        else:
-            with st.spinner("Søker..."):
-                st.session_state.search_results = st.session_state.client.search_products(query)
+    # Søk ved enter eller knapp
+    if (do_search or (query and query != st.session_state.last_query)) and query.strip():
+        st.session_state.last_query = query
+        with st.spinner("Søker..."):
+            st.session_state.search_results = client.search_products(query)
 
-    if st.session_state.search_results:
-        db: Database = st.session_state.db
-        kurver = db.get_handlekurver() if db else []
+    results = st.session_state.search_results
+    if results:
+        # Velg hvilken kurv
+        kurver = db.get_handlekurver()
         kurv_map = {k["name"]: k["id"] for k in kurver}
 
-        valgt_kurv = st.selectbox(
-            "Legg til i handlekurv:",
-            options=list(kurv_map.keys()) if kurv_map else ["(Opprett handlekurv i Tab 2 først)"],
-        )
+        if kurv_map:
+            valgt_kurv = st.selectbox(
+                "Legg til i",
+                options=list(kurv_map.keys()),
+                format_func=lambda x: f"🧺 {x}",
+            )
+        else:
+            st.info("💡 Opprett en handlekurv i **Mine handlekurver** for å legge til varer")
+            valgt_kurv = None
 
-        st.markdown(f"**{len(st.session_state.search_results)} resultater:**")
-        for p in st.session_state.search_results:
-            c1, c2, c3 = st.columns([4, 1.5, 0.8])
-            with c1:
-                st.markdown(f"**{p['name']}**")
-                st.caption(f"{p.get('brand', '')}  ·  {p.get('store', {}).get('name', '')}")
-            with c2:
-                pris = p.get("current_price")
-                st.metric("", f"{pris:.2f} kr" if pris else "–")
-            with c3:
-                if st.button("➕", key=f"add_{p['id']}"):
-                    kid = kurv_map.get(valgt_kurv)
-                    if kid and db:
-                        db.add_item(kid, {"name": p["name"], "ean": p.get("ean"), "brand": p.get("brand"), "image": p.get("image")})
-                        st.success("Lagt til!", icon="✅")
+        st.markdown(f"<p style='color:#666;font-size:0.85rem;margin:1rem 0 0.5rem'>{len(results)} resultater for «{st.session_state.last_query}»</p>", unsafe_allow_html=True)
+
+        for p in results:
+            with st.container():
+                c1, c2, c3, c4 = st.columns([3, 1.2, 1.2, 0.7])
+                with c1:
+                    name = p.get("name", "Ukjent")
+                    brand = p.get("brand") or ""
+                    store = p.get("store", {}).get("name", "") if isinstance(p.get("store"), dict) else ""
+                    st.markdown(f"**{name}**")
+                    tags = " ".join(f'<span class="store-tag">{t}</span>' for t in [brand, store] if t)
+                    if tags:
+                        st.markdown(tags, unsafe_allow_html=True)
+                with c2:
+                    pris = p.get("current_price")
+                    if pris:
+                        st.markdown(f"<p style='font-family:Syne;font-weight:700;font-size:1.1rem;color:#fff;margin:0.4rem 0 0'>{pris:.2f} kr</p>", unsafe_allow_html=True)
                     else:
-                        st.warning("Opprett en handlekurv i Tab 2 først.")
-            st.divider()
+                        st.markdown("<p style='color:#555;margin:0.4rem 0 0'>–</p>", unsafe_allow_html=True)
+                with c3:
+                    ean = p.get("ean") or ""
+                    if ean:
+                        st.markdown(f"<p style='color:#444;font-size:0.75rem;margin:0.5rem 0 0'>EAN {ean}</p>", unsafe_allow_html=True)
+                with c4:
+                    if st.button("＋", key=f"add_{p.get('id', uuid.uuid4())}"):
+                        if valgt_kurv and kurv_map.get(valgt_kurv):
+                            db.add_item(
+                                kurv_map[valgt_kurv],
+                                p.get("name", ""),
+                                p.get("ean"),
+                                p.get("brand"),
+                            )
+                            st.toast(f"✅ {p.get('name', '')} lagt til!", icon="✅")
+                        else:
+                            st.warning("Velg en handlekurv først")
+                st.divider()
 
-# ── TAB 2: Handlekurver ───────────────────────────────────────────────────────
+    elif st.session_state.last_query and not results:
+        st.markdown("<p style='color:#555;text-align:center;padding:2rem'>Ingen resultater. Prøv et annet søkeord.</p>", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 – HANDLEKURVER
+# ══════════════════════════════════════════════════════════════════════════════
 with tab2:
-    db: Database = st.session_state.db
-    if not db:
-        st.info("Koble til i sidepanelet for å bruke handlekurver.")
-    else:
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            ny_navn = st.text_input("Navn på ny handlekurv", placeholder="f.eks. Ukeshandel")
-        with c2:
-            st.write("")
-            if st.button("➕ Opprett", use_container_width=True):
-                if ny_navn:
-                    db.create_handlekurv(ny_navn)
-                    st.rerun()
+    st.markdown("### Mine handlekurver")
 
-        st.divider()
-        for kurv in db.get_handlekurver():
-            with st.expander(f"🧺 {kurv['name']} — {len(kurv.get('items', []))} varer", expanded=True):
-                items = kurv.get("items", [])
-                if not items:
-                    st.caption("Ingen varer ennå. Søk i Tab 1.")
+    c1, c2 = st.columns([4, 1])
+    with c1:
+        ny_navn = st.text_input(
+            "ny kurv",
+            placeholder="Gi handlekurven et navn, f.eks. Ukeshandel ...",
+            label_visibility="collapsed",
+            key="ny_kurv_input",
+        )
+    with c2:
+        if st.button("Opprett →", use_container_width=True):
+            if ny_navn.strip():
+                db.create_handlekurv(ny_navn.strip())
+                st.rerun()
+            else:
+                st.warning("Skriv inn et navn")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    kurver = db.get_handlekurver()
+    if not kurver:
+        st.markdown("""
+        <div style="text-align:center;padding:3rem;color:#444">
+            <p style="font-size:3rem;margin:0">🧺</p>
+            <p style="font-family:Syne;font-size:1.1rem;color:#666;margin:0.5rem 0">Ingen handlekurver ennå</p>
+            <p style="font-size:0.85rem">Opprett en ovenfor og søk etter varer i Søk-fanen</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    for kurv in kurver:
+        items = kurv.get("items", [])
+        antall = len(items)
+
+        with st.expander(f"🧺  {kurv['name']}  ·  {antall} {'vare' if antall == 1 else 'varer'}", expanded=True):
+            if not items:
+                st.markdown("<p style='color:#444;font-size:0.9rem'>Ingen varer. Søk etter produkter i Søk-fanen.</p>", unsafe_allow_html=True)
+            else:
                 for item in items:
-                    c1, c2, c3 = st.columns([4, 1, 0.5])
+                    c1, c2, c3 = st.columns([4, 1.2, 0.6])
                     with c1:
+                        brand = item.get("brand") or ""
                         st.markdown(f"**{item['name']}**")
-                        st.caption(item.get("brand") or "")
+                        if brand:
+                            st.markdown(f"<span class='store-tag'>{brand}</span>", unsafe_allow_html=True)
                     with c2:
-                        ny_ant = st.number_input("", min_value=1, value=item.get("quantity", 1),
-                                                  key=f"qty_{item['id']}", label_visibility="collapsed")
+                        ny_ant = st.number_input(
+                            "ant",
+                            min_value=1,
+                            max_value=99,
+                            value=int(item.get("quantity", 1)),
+                            key=f"qty_{item['id']}",
+                            label_visibility="collapsed",
+                        )
                         if ny_ant != item.get("quantity", 1):
                             db.update_quantity(item["id"], ny_ant)
                     with c3:
-                        if st.button("🗑", key=f"del_{item['id']}"):
+                        if st.button("✕", key=f"del_{item['id']}"):
                             db.remove_item(item["id"])
                             st.rerun()
-                if items:
-                    st.divider()
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("📊 Analyser", key=f"an_{kurv['id']}", use_container_width=True):
-                            st.session_state["analyser_kurv_id"] = kurv["id"]
-                    with c2:
-                        if st.button("🗑 Slett kurv", key=f"dk_{kurv['id']}", use_container_width=True):
-                            db.delete_handlekurv(kurv["id"])
-                            st.rerun()
 
-# ── TAB 3: Prisanalyse ────────────────────────────────────────────────────────
+            st.markdown("<br>", unsafe_allow_html=True)
+            ca, cb = st.columns([1, 1])
+            with ca:
+                if st.button("📊  Analyser priser", key=f"an_{kurv['id']}", use_container_width=True):
+                    st.session_state["analyser_id"] = kurv["id"]
+                    st.toast("Åpne Prisanalyse-fanen →")
+            with cb:
+                if st.button("Slett kurv", key=f"dk_{kurv['id']}", use_container_width=True):
+                    db.delete_handlekurv(kurv["id"])
+                    st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 – PRISANALYSE
+# ══════════════════════════════════════════════════════════════════════════════
 with tab3:
-    db: Database = st.session_state.db
-    client: KassalappClient = st.session_state.client
+    st.markdown("### Prisanalyse")
 
-    if not client:
-        st.info("Koble til API-nøkkel i sidepanelet.")
-    elif not db:
-        st.info("Koble til i sidepanelet.")
-    else:
-        kurver = db.get_handlekurver()
-        if not kurver:
-            st.info("Opprett en handlekurv med varer i Tab 2 først.")
+    kurver = db.get_handlekurver()
+    if not kurver:
+        st.markdown("""
+        <div style="text-align:center;padding:3rem;color:#444">
+            <p style="font-size:3rem;margin:0">📊</p>
+            <p style="font-family:Syne;font-size:1.1rem;color:#666;margin:0.5rem 0">Ingen handlekurver å analysere</p>
+            <p style="font-size:0.85rem">Opprett en handlekurv og legg til varer først</p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
+    # Forhåndsvelg kurv om klikket fra tab2
+    default_idx = 0
+    if "analyser_id" in st.session_state:
+        ids = [k["id"] for k in kurver]
+        if st.session_state["analyser_id"] in ids:
+            default_idx = ids.index(st.session_state["analyser_id"])
+
+    valgt = st.selectbox(
+        "Velg handlekurv",
+        options=kurver,
+        index=default_idx,
+        format_func=lambda k: f"🧺 {k['name']} ({len(k.get('items',[]))} varer)",
+    )
+
+    c1, c2 = st.columns([2, 2])
+    with c1:
+        kombiner = st.toggle("Kombiner flere butikker", value=True)
+    with c2:
+        if kombiner:
+            maks = st.select_slider("Maks antall butikker", options=[2, 3, 4, 5], value=3)
         else:
-            valgt = st.selectbox("Velg handlekurv", kurver, format_func=lambda k: k["name"])
+            maks = 1
 
-            c1, c2 = st.columns(2)
-            with c1:
-                enkel    = st.checkbox("🏪 Beste enkeltbutikk", value=True)
-                kombiner = st.checkbox("🔀 Optimaliser på tvers av butikker", value=True)
-            with c2:
-                maks = st.slider("Maks antall butikker", 2, 5, 3, disabled=not kombiner)
+    if st.button("🚀  Kjør prisanalyse", type="primary", use_container_width=True):
+        items = valgt.get("items", [])
+        eans  = [i["ean"] for i in items if i.get("ean")]
 
-            if st.button("🚀 Kjør prisanalyse", type="primary", use_container_width=True):
-                items = valgt.get("items", [])
-                eans  = [i["ean"] for i in items if i.get("ean")]
+        if not items:
+            st.warning("Handlekurven er tom.")
+        elif not eans:
+            st.warning("Ingen av varene har EAN-koder. Søk etter produkter via Søk-fanen.")
+        elif not st.session_state.favoritter:
+            st.warning("Velg minst én butikk i sidepanelet.")
+        else:
+            with st.spinner(f"Henter priser for {len(eans)} varer..."):
+                priser = client.get_bulk_prices(eans)
 
-                if not eans:
-                    st.warning("Ingen varer med EAN-koder. Søk etter produkter via søkefeltet for å sikre EAN-koder.")
+            if not priser:
+                st.error("Klarte ikke hente priser. Prøv igjen.")
+            else:
+                opt     = Optimizer(priser, items, st.session_state.favoritter)
+                ranking = opt.rank_stores()
+
+                if not ranking:
+                    st.warning("Ingen prisdata funnet for valgte butikker og varer.")
+                    st.stop()
+
+                st.markdown("---")
+
+                # ── Beste enkeltbutikk ─────────────────────────────────────
+                st.markdown("#### 🏪 Beste enkeltbutikk")
+                medals = ["🥇", "🥈", "🥉", "4.", "5."]
+
+                for i, r in enumerate(ranking[:5]):
+                    is_best = i == 0
+                    card_class = "card card-best" if is_best else "card"
+                    c1, c2, c3 = st.columns([3, 1.5, 2])
+                    with c1:
+                        st.markdown(f"**{medals[i]} {r['emoji']} {r['name']}**")
+                        funnet = r['found']
+                        totalt = len(eans)
+                        farge  = "#4ade80" if funnet == totalt else "#f59e0b"
+                        st.markdown(f"<p style='font-size:0.8rem;color:{farge};margin:0'>{funnet}/{totalt} varer funnet</p>", unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f"<p style='font-family:Syne;font-weight:700;font-size:1.3rem;color:#fff;margin:0.3rem 0'>{r['total']:.2f} kr</p>", unsafe_allow_html=True)
+                    with c3:
+                        if is_best:
+                            st.markdown('<span class="badge-best">Billigst</span>', unsafe_allow_html=True)
+                        else:
+                            diff = r["total"] - ranking[0]["total"]
+                            st.markdown(f"<p style='color:#ef4444;font-size:0.9rem;margin:0.3rem 0'>+{diff:.2f} kr</p>", unsafe_allow_html=True)
+                    st.divider()
+
+                # ── Kombinert optimalisering ───────────────────────────────
+                if kombiner and maks > 1:
+                    st.markdown(f"#### 🔀 Optimal fordeling på {maks} butikker")
+                    resultat  = opt.optimize_split(max_stores=maks)
+
+                    if resultat:
+                        total_opt  = sum(r["price"] for r in resultat)
+                        besparelse = ranking[0]["total"] - total_opt
+
+                        if besparelse > 0.5:
+                            st.markdown(f"""
+                            <div class="savings-box">
+                                <p style="color:#4ade80;font-size:0.8rem;font-family:Syne;letter-spacing:0.1em;text-transform:uppercase;margin:0">Du sparer</p>
+                                <p class="savings-amount">{besparelse:.2f} kr</p>
+                                <p style="color:#666;font-size:0.85rem;margin:0">mot å handle alt på {ranking[0]['name']}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.info(f"Å kombinere butikker gir minimal besparelse ({besparelse:.2f} kr). Det er enklest å handle alt på **{ranking[0]['name']}**.")
+
+                        # Gruppe per butikk
+                        grupper: dict = {}
+                        for r in resultat:
+                            grupper.setdefault(r["store_code"], []).append(r)
+
+                        col_list = st.columns(min(len(grupper), 3))
+                        for idx, (code, varer) in enumerate(grupper.items()):
+                            sub = sum(v["price"] for v in varer)
+                            col = col_list[idx % len(col_list)]
+                            with col:
+                                st.markdown(f"""
+                                <div class="card">
+                                    <p style="font-family:Syne;font-weight:700;font-size:1rem;color:#fff;margin:0 0 0.5rem">
+                                        {STORE_EMOJI.get(code,'')} {STORE_NAMES.get(code, code)}
+                                    </p>
+                                    <p style="font-family:Syne;font-size:1.4rem;font-weight:800;color:#7c5cfc;margin:0 0 0.8rem">{sub:.2f} kr</p>
+                                """, unsafe_allow_html=True)
+                                for v in varer:
+                                    st.markdown(f"<p style='font-size:0.85rem;color:#aaa;margin:0.2rem 0'>· {v['name']} × {v['quantity']} — {v['price']:.2f} kr</p>", unsafe_allow_html=True)
+                                st.markdown("</div>", unsafe_allow_html=True)
+
+                # ── Prismatrise ────────────────────────────────────────────
+                st.markdown("#### 📋 Prismatrise")
+                st.caption("Grønn = billigst per vare")
+                matrise = opt.price_matrix()
+                if matrise is not None:
+                    st.dataframe(
+                        matrise.style
+                            .highlight_min(axis=1, color="#1a3a2a")
+                            .format(lambda x: f"{x:.2f} kr" if x else "–"),
+                        use_container_width=True,
+                        height=min(400, 40 + 35 * len(matrise)),
+                    )
                 else:
-                    with st.spinner("Henter priser fra Kassalapp..."):
-                        priser = client.get_bulk_prices(eans)
-
-                    if not priser:
-                        st.error("Klarte ikke hente priser. Sjekk API-nøkkelen.")
-                    else:
-                        opt     = Optimizer(priser, items, st.session_state.favoritter)
-                        ranking = opt.rank_stores()
-                        st.markdown("---")
-
-                        if enkel and ranking:
-                            st.markdown("### 🏪 Beste enkeltbutikk")
-                            medals = ["🥇", "🥈", "🥉", "4.", "5."]
-                            for i, (code, info) in enumerate(ranking[:5]):
-                                c1, c2, c3 = st.columns([2, 1.5, 2])
-                                with c1:
-                                    st.markdown(f"**{medals[i]} {info['store_name']}**")
-                                    st.caption(f"{info['found_items']} av {len(eans)} varer funnet")
-                                with c2:
-                                    st.metric("Total", f"{info['total']:.2f} kr")
-                                with c3:
-                                    if i == 0:
-                                        st.markdown('<span class="savings">Billigst ✓</span>', unsafe_allow_html=True)
-                                    else:
-                                        st.caption(f"+{info['total'] - ranking[0][1]['total']:.2f} kr dyrere")
-                                st.divider()
-
-                        if kombiner:
-                            st.markdown(f"### 🔀 Optimal fordeling (maks {maks} butikker)")
-                            resultat = opt.optimize_split(max_stores=maks)
-
-                            if resultat:
-                                total_opt = sum(r["price"] for r in resultat)
-                                st.metric("Optimal totalpris", f"{total_opt:.2f} kr")
-
-                                if ranking:
-                                    besparelse = ranking[0][1]["total"] - total_opt
-                                    if besparelse > 0:
-                                        st.success(f"💰 Du sparer **{besparelse:.2f} kr** mot beste enkeltbutikk!")
-
-                                grupper: dict = {}
-                                for r in resultat:
-                                    grupper.setdefault(r["store_name"], []).append(r)
-
-                                for butikk, varer in grupper.items():
-                                    sub = sum(v["price"] for v in varer)
-                                    with st.expander(f"🏪 **{butikk}** — {sub:.2f} kr ({len(varer)} varer)"):
-                                        st.dataframe(
-                                            pd.DataFrame([{"Produkt": v["name"], "Antall": v["quantity"], "Pris": f"{v['price']:.2f} kr"} for v in varer]),
-                                            hide_index=True, use_container_width=True,
-                                        )
-
-                        st.markdown("### 📋 Prismatrise (grønn = billigst per vare)")
-                        matrise = opt.price_matrix()
-                        if matrise is not None:
-                            st.dataframe(
-                                matrise.style.highlight_min(axis=1, color="#d4edda"),
-                                use_container_width=True,
-                            )
+                    st.caption("Ingen prisdata tilgjengelig for prismatrise.")
