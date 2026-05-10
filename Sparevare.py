@@ -62,7 +62,7 @@ def browser_search(query: str) -> list[dict]:
     (async () => {{
         const key = "{KASSALAPP_API_KEY}";
         const q   = encodeURIComponent("{query.strip().replace('"', '')}");
-        const url = `https://kassal.app/api/v1/products?search=${{q}}&size=25&unique=true&sort=name_asc`;
+        const url = `https://kassal.app/api/v1/products?search=${{q}}&size=25&unique=true`;
 
         try {{
             const resp = await fetch(url, {{
@@ -473,7 +473,7 @@ with tab1:
       document.getElementById("results").innerHTML = "";
 
       try {{
-        const url = `https://kassal.app/api/v1/products?search=${{encodeURIComponent(q)}}&size=25&unique=true&sort=name_asc`;
+        const url = `https://kassal.app/api/v1/products?search=${encodeURIComponent(q)}&size=25&unique=true`;
         const resp = await fetch(url, {{
           headers: {{
             "Authorization": `Bearer ${{API_KEY}}`,
